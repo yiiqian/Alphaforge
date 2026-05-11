@@ -3,6 +3,8 @@
 子命令：
     strategy list              列出已注册策略
     strategy info NAME         查看某策略元信息
+    data update                拉取 Tushare 数据到本地 parquet
+    data status                查看数据湖状态
     backtest run               跑回测
 """
 
@@ -74,6 +76,95 @@ def strategy_info(name: str) -> None:
     console.print(f"[cyan]benchmark[/]   : {cls.benchmark}")
     console.print(f"[cyan]module[/]      : {cls.__module__}")
     console.print(f"[cyan]docstring[/]   :\n{cls.__doc__ or '(none)'}")
+
+
+# ---------------- data ----------------
+
+@main.group()
+def data() -> None:
+    """数据湖管理：拉取 Tushare 行情到本地 parquet。"""
+
+
+@data.command("update")
+@click.option("--start", default="2018-01-01", help="拉取起始日（默认 2018-01-01）")
+@click.option("--end", default=None, help="拉取截止日（默认今日）")
+@click.option("--root", default=None,
+              help="数据湖根目录（默认 <project_root>/data_lake/，或读环境变量 ALPHAFORGE_DATA_LAKE）")
+@click.option("--indices", default="000300.SH,000905.SH,000852.SH,000001.SH",
+              help="基准指数列表（逗号分隔）")
+def data_update(start: str, end: str | None, root: str | None, indices: str) -> None:
+    """从 Tushare 增量更新本地数据湖。
+
+    第一次跑会比较慢（按日逐次拉，一年 ~252 个交易日，约 2-5 分钟）。
+    后续每天增量只拉新增的几个交易日，秒级完成。
+    """
+    import os
+    from alphaforge.data.updater import update_all
+
+    if root is None:
+        root = os.environ.get("ALPHAFORGE_DATA_LAKE") or str(project_root() / "data_lake")
+
+    if not os.environ.get("TUSHARE_TOKEN"):
+        console.print(
+            "[red]TUSHARE_TOKEN not set.[/] "
+            "Put it in .env (TUSHARE_TOKEN=xxx) or `export TUSHARE_TOKEN=...`"
+        )
+        raise SystemExit(1)
+
+    idx_list = [c.strip() for c in indices.split(",") if c.strip()]
+    console.print(f"[cyan]data_lake[/] = {root}")
+    console.print(f"[cyan]window[/]    = {start} -> {end or 'today'}")
+    console.print(f"[cyan]indices[/]   = {idx_list}")
+
+    summary = update_all(root=Path(root), start=start, end=end, indices=idx_list)
+
+    table = Table(title="Update Summary")
+    table.add_column("panel", style="cyan")
+    table.add_column("days written", justify="right")
+    for k, v in summary.items():
+        table.add_row(k, str(v))
+    console.print(table)
+    console.print(f"[green]Done.[/] data_lake at {root}")
+
+
+@data.command("status")
+@click.option("--root", default=None, help="数据湖根目录")
+def data_status(root: str | None) -> None:
+    """查看数据湖游标 + 文件统计。"""
+    import json as _json
+    import os
+    from alphaforge.data.updater import DataLakePaths
+
+    if root is None:
+        root = os.environ.get("ALPHAFORGE_DATA_LAKE") or str(project_root() / "data_lake")
+
+    paths = DataLakePaths(Path(root))
+    if not paths.root.exists():
+        console.print(f"[red]No data_lake at {root}.[/] Run `alphaforge data update` first.")
+        raise SystemExit(1)
+
+    console.print(f"[cyan]root:[/] {paths.root}")
+    if paths.meta.exists():
+        meta = _json.loads(paths.meta.read_text(encoding="utf-8"))
+        for k, v in meta.items():
+            console.print(f"  {k}: {v}")
+    else:
+        console.print("[yellow]No _meta.json (never updated).[/]")
+
+    table = Table(title="Files")
+    table.add_column("file")
+    table.add_column("size", justify="right")
+    for sub in ("trade_cal.parquet", "stock_basic.parquet", "suspend.parquet"):
+        p = paths.root / sub
+        size = p.stat().st_size if p.exists() else 0
+        table.add_row(str(p.relative_to(paths.root)), f"{size/1024:.1f} KB" if size else "-")
+    for sub in ("daily", "adj_factor", "stk_limit", "index_daily"):
+        d = paths.root / sub
+        if d.exists():
+            n = sum(1 for _ in d.glob("*.parquet"))
+            total = sum(p.stat().st_size for p in d.glob("*.parquet"))
+            table.add_row(f"{sub}/", f"{n} files, {total/1024/1024:.1f} MB")
+    console.print(table)
 
 
 # ---------------- backtest ----------------

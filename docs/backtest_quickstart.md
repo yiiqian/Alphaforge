@@ -44,15 +44,15 @@ trades.parquet          # 每笔成交（含 buy/sell, qty, price, fees）
 config.snapshot.yaml    # 本次跑的完整参数（可复现）
 ```
 
-## 4. 用真实 Tushare 数据跑（M1 数据层完成后）
+## 4. 用真实 Tushare 数据跑
 
 ```bash
 echo "TUSHARE_TOKEN=你的token" > .env
-uv run alphaforge data update          # 增量更新数据湖
-uv run alphaforge backtest run --strategy demo_momentum --config ... --data tushare
+uv run alphaforge data update          # 增量更新数据湖（首次约 5-10 分钟）
+uv run alphaforge backtest run --strategy demo_momentum --config configs/run/demo_momentum.yaml --data tushare
 ```
 
-> M1 数据层尚未实现 — `--data tushare` 会报 `ImportError: tushare_bundle`。先用 `--data synthetic`。
+详细数据层说明见 [docs/data_layer.md](data_layer.md)。
 
 ## 5. 写自己的策略
 
