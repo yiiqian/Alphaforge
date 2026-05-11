@@ -1,0 +1,19 @@
+# Demo: 12 个月动量 Top 10，月度调仓
+strategy: demo_momentum
+
+period:
+  start: "2022-01-01"
+  end:   "2024-12-31"
+
+benchmark: "000300.SH"
+init_cash: 1_000_000
+
+costs:
+  commission: 0.00025         # 双边万 2.5
+  min_commission: 5.0         # 最低 5 元
+  stamp_tax: 0.001            # 卖出印花税 0.1%
+  slippage: 0.001             # 千 1 滑点
+
+params:
+  top_n: 10
+  lookback: 120               # 计算 120 日动量

@@ -1,0 +1,16 @@
+# 数据源 & 数据湖路径配置
+data_lake:
+  root: data_lake
+  raw: data_lake/raw          # Tushare 原始落地
+  derived: data_lake/derived  # 衍生表（复权后等）
+
+tushare:
+  # Token 从环境变量 TUSHARE_TOKEN 读取（.env 文件）
+  rate_limit_per_minute: 100  # 防止超过 Tushare 接口限频
+  retry: 3
+  retry_backoff: 2.0
+
+# 默认拉取窗口
+default_window:
+  start: "2020-01-01"
+  end:   ""                   # 空 = today
