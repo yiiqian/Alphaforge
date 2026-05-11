@@ -47,6 +47,8 @@ def mini_bundle():
     }
 
     data = _SynthData(panels)
-    universe = _SynthUniverse(codes, data, list_dates={c: days[0] for c in codes})
+    # 把上市日设在 days[0] 之前 120 天，避开"次新股 < 60 天"过滤
+    list_date = days[0] - pd.Timedelta(days=120)
+    universe = _SynthUniverse(codes, data, list_dates={c: list_date for c in codes})
     cal = _SynthCalendar(days)
     return data, universe, cal, days, codes

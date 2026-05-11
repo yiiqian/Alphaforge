@@ -107,7 +107,9 @@ def make_synthetic_bundle(
     }
 
     data_api = _SynthData(panels)
-    list_dates = {c: days[0] for c in codes}
+    # 假设所有合成股票早在回测起点之前 1 年就已上市，避开"上市 < 60 天剔除"
+    list_date = days[0] - pd.Timedelta(days=365)
+    list_dates = {c: list_date for c in codes}
     universe_api = _SynthUniverse(codes, data_api, list_dates=list_dates)
     cal_api = _SynthCalendar(days)
     return data_api, universe_api, cal_api
