@@ -164,21 +164,51 @@ def _fallback_calendar(start: str, end: str) -> pd.DataFrame:
 
 
 def update_stock_basic(client: TushareClient, paths: DataLakePaths) -> pd.DataFrame:
-    """全量刷新股票基本面（含已退市）。"""
-    logger.info("Fetching stock_basic (L + D + P)")
+    """全量刷新股票基本面（仅上市状态）。
+
+    stock_basic 是只刷一次的小表，缺失时降级使用 daily 表里的代码兜底。
+    Tushare 对该接口限频极严（1 次/小时），如果已有缓存就跳过。
+    """
+    if paths.stock_basic.exists() or paths.stock_basic.with_suffix(".csv").exists():
+        logger.info("stock_basic already cached, skipping (delete file to force refresh)")
+        return _read_existing(paths.stock_basic)
+
+    logger.info("Fetching stock_basic")
     try:
-        df = client.stock_basic(list_status="ALL")
+        df = client.stock_basic(list_status="L")
     except Exception as e:  # noqa: BLE001
         if _is_permission_error(e):
             logger.warning(
-                "stock_basic: no API permission. 退化模式：universe 将基于 daily 表中出现过的代码构造，"
+                "stock_basic: no API permission. 退化模式：universe 将基于 daily 表中出现过的代码，"
                 "无法过滤次新/退市/ST。"
+            )
+            df = pd.DataFrame()
+        elif "频" in str(e) or "超限" in str(e):
+            logger.warning(
+                "stock_basic: rate-limited (Tushare 1次/小时). 退化模式：universe 将基于 daily 表里的代码。"
+                "稍后可单独重跑获取完整 stock_basic。"
             )
             df = pd.DataFrame()
         else:
             raise
     _write_parquet(df, paths.stock_basic)
     return df
+
+
+def _read_existing(path: Path) -> pd.DataFrame:
+    """读取已存在的 parquet 或 csv，找不到返回空 DF。"""
+    if path.exists():
+        try:
+            return pd.read_parquet(path)
+        except Exception:
+            pass
+    csv = path.with_suffix(".csv")
+    if csv.exists():
+        try:
+            return pd.read_csv(csv)
+        except Exception:
+            pass
+    return pd.DataFrame()
 
 
 def _trade_dates_in(cal_df: pd.DataFrame, start: pd.Timestamp, end: pd.Timestamp) -> list[pd.Timestamp]:

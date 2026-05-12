@@ -81,7 +81,10 @@ class TushareClient:
 
     def _call(self, api_name: str, **kwargs: Any) -> pd.DataFrame:
         last_exc: Exception | None = None
-        for attempt in range(self.cfg.max_retries):
+        # 限频错误重试更激进（多 5 次 + 等满 1 分钟）
+        rate_limit_retries_left = 5
+        normal_attempt = 0
+        while True:
             self._throttle()
             try:
                 fn = getattr(self._pro, api_name)
@@ -92,12 +95,29 @@ class TushareClient:
             except Exception as e:  # noqa: BLE001
                 last_exc = e
                 msg = str(e)
-                # 权限错误不可恢复，立刻抛出（让上层走优雅降级路径）
-                if any(k in msg for k in ("没有接口", "权限", "积分", "permission")):
+                # 权限错误：不可恢复，立刻抛
+                if any(k in msg for k in ("没有接口", "permission")) or "权限" in msg and "频" not in msg:
                     raise
-                wait = self.cfg.retry_backoff ** attempt
+                # 限频错误：等满一分钟后重试
+                if "频率超限" in msg or "频次" in msg or "超限" in msg:
+                    if rate_limit_retries_left <= 0:
+                        raise RuntimeError(
+                            f"Tushare {api_name} still rate-limited after multiple 60s waits"
+                        ) from last_exc
+                    rate_limit_retries_left -= 1
+                    logger.warning(
+                        f"Tushare {api_name} rate-limited; sleeping 65s before retry "
+                        f"({rate_limit_retries_left} retries left): {e}"
+                    )
+                    time.sleep(65)
+                    continue
+                # 其他临时错误：指数退避
+                normal_attempt += 1
+                if normal_attempt >= self.cfg.max_retries:
+                    break
+                wait = self.cfg.retry_backoff ** normal_attempt
                 logger.warning(
-                    f"Tushare {api_name} failed (attempt {attempt + 1}/"
+                    f"Tushare {api_name} failed (attempt {normal_attempt}/"
                     f"{self.cfg.max_retries}): {e}; retrying in {wait:.1f}s"
                 )
                 time.sleep(wait)
@@ -122,26 +142,24 @@ class TushareClient:
 
     def stock_basic(self, list_status: str = "L") -> pd.DataFrame:
         """股票基本面信息。
-        list_status: L=上市 D=退市 P=暂停。这里取全量（L+D+P）需多次调用合并。
+
+        list_status: L=上市 D=退市 P=暂停。
+        ALL 模式下原本要调 3 次，但 Tushare 对 stock_basic 限频很狠（1 次/小时），
+        所以只调 1 次"上市"，回测期内未退市的就够用了。
         """
-        frames = []
-        for status in ([list_status] if list_status != "ALL" else ["L", "D", "P"]):
-            df = self._call(
-                "stock_basic",
-                exchange="",
-                list_status=status,
-                fields="ts_code,symbol,name,area,industry,market,list_date,delist_date",
-            )
-            if not df.empty:
-                df["list_status"] = status
-                frames.append(df)
-        if not frames:
-            return pd.DataFrame()
-        out = pd.concat(frames, ignore_index=True)
-        out["list_date"] = pd.to_datetime(out["list_date"], errors="coerce")
-        if "delist_date" in out.columns:
-            out["delist_date"] = pd.to_datetime(out["delist_date"], errors="coerce")
-        return out
+        df = self._call(
+            "stock_basic",
+            exchange="",
+            list_status="L" if list_status in ("L", "ALL") else list_status,
+            fields="ts_code,symbol,name,area,industry,market,list_date,delist_date",
+        )
+        if df.empty:
+            return df
+        df["list_status"] = "L"
+        df["list_date"] = pd.to_datetime(df["list_date"], errors="coerce")
+        if "delist_date" in df.columns:
+            df["delist_date"] = pd.to_datetime(df["delist_date"], errors="coerce")
+        return df
 
     def daily(self, trade_date: str | None = None, ts_code: str | None = None,
               start: str | None = None, end: str | None = None) -> pd.DataFrame:
