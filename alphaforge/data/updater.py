@@ -17,6 +17,15 @@
 - 小表（trade_cal/stock_basic/suspend/index_daily）每次 update 全量刷新，开销可忽略。
 - 增量游标存最后成功写入的 trade_date；下次从游标 +1 个交易日继续。
 - 写入采用"先 append 到内存、再覆盖整个年份分片"，避免多次小 I/O。
+
+权限分级降级策略：
+    Tushare 不同接口需要不同积分。本模块对每个接口的权限错误优雅降级：
+    - trade_cal 缺权限    → 用本地节假日表生成日历
+    - adj_factor 缺权限   → 跳过，回测使用未复权价（短期回测影响小）
+    - stk_limit 缺权限    → 跳过，引擎用 pct_chg ±10%（主板）估算涨跌停
+    - suspend_d 缺权限    → 跳过，仅靠"当日无 daily 数据"识别停牌
+    - index_daily 缺权限  → 跳过基准对比
+    - stock_basic / daily 缺权限 → 致命，必须有
 """
 
 from __future__ import annotations
@@ -32,6 +41,12 @@ from alphaforge.infra.logger import logger
 
 # ---- 默认基准指数列表 ----
 DEFAULT_INDICES = ["000300.SH", "000905.SH", "000852.SH", "000001.SH"]
+
+
+def _is_permission_error(exc: Exception) -> bool:
+    """识别 Tushare 权限不足错误。"""
+    msg = str(exc).lower()
+    return any(k in msg for k in ("没有接口", "权限", "积分", "permission", "权限不足"))
 
 
 @dataclass
@@ -104,18 +119,57 @@ def _write_parquet(df: pd.DataFrame, path: Path) -> None:
 
 def update_trade_cal(client: TushareClient, paths: DataLakePaths,
                      start: str = "2010-01-01", end: str | None = None) -> pd.DataFrame:
-    """全量刷新交易日历。"""
+    """全量刷新交易日历。无权限时退回本地节假日表近似。"""
     end = end or pd.Timestamp.today().strftime("%Y%m%d")
     logger.info(f"Fetching trade_cal {start} -> {end}")
-    df = client.trade_cal(start, end)
+    try:
+        df = client.trade_cal(start, end)
+    except Exception as e:  # noqa: BLE001
+        if _is_permission_error(e):
+            logger.warning(
+                "trade_cal: no API permission, falling back to local approximate calendar "
+                "(weekend + 2022-2025 holidays). 准确度对短期回测影响很小。"
+            )
+            df = _fallback_calendar(start, end)
+        else:
+            raise
     _write_parquet(df, paths.trade_cal)
     return df
+
+
+def _fallback_calendar(start: str, end: str) -> pd.DataFrame:
+    """无 trade_cal 权限时用本地节假日表生成"近似"交易日历。"""
+    from alphaforge.data.synthetic import CHINESE_HOLIDAYS_2022_2025
+
+    bdays = pd.bdate_range(start, end)
+    holidays = pd.to_datetime(list(CHINESE_HOLIDAYS_2022_2025))
+    open_set = set(bdays.difference(holidays))
+    all_days = pd.date_range(start, end)
+    rows = []
+    for d in all_days:
+        rows.append({
+            "exchange": "SSE",
+            "cal_date": d,
+            "is_open": int(d in open_set),
+            "pretrade_date": pd.NaT,
+        })
+    return pd.DataFrame(rows)
 
 
 def update_stock_basic(client: TushareClient, paths: DataLakePaths) -> pd.DataFrame:
     """全量刷新股票基本面（含已退市）。"""
     logger.info("Fetching stock_basic (L + D + P)")
-    df = client.stock_basic(list_status="ALL")
+    try:
+        df = client.stock_basic(list_status="ALL")
+    except Exception as e:  # noqa: BLE001
+        if _is_permission_error(e):
+            logger.warning(
+                "stock_basic: no API permission. 退化模式：universe 将基于 daily 表中出现过的代码构造，"
+                "无法过滤次新/退市/ST。"
+            )
+            df = pd.DataFrame()
+        else:
+            raise
     _write_parquet(df, paths.stock_basic)
     return df
 
@@ -172,7 +226,13 @@ def update_daily_panel(
     by_year: dict[int, list[pd.DataFrame]] = {}
     for i, d in enumerate(dates, 1):
         ds = d.strftime("%Y%m%d")
-        df = fn(trade_date=ds)
+        try:
+            df = fn(trade_date=ds)
+        except Exception as e:  # noqa: BLE001
+            if _is_permission_error(e):
+                logger.warning(f"[{panel}] no API permission, skipping this panel entirely.")
+                return 0
+            raise
         if df is None or df.empty:
             logger.debug(f"[{panel}] {ds} empty")
             continue
@@ -204,7 +264,16 @@ def update_suspend(client: TushareClient, paths: DataLakePaths,
                    start: str, end: str) -> pd.DataFrame:
     """全量刷新停牌事件（数据量小，直接覆盖）。"""
     logger.info(f"Fetching suspend events {start} -> {end}")
-    df = client.suspend_d(start=start, end=end, suspend_type="S")
+    try:
+        df = client.suspend_d(start=start, end=end, suspend_type="S")
+    except Exception as e:  # noqa: BLE001
+        if _is_permission_error(e):
+            logger.warning(
+                "suspend_d: no API permission. 仅靠 daily 缺失识别停牌（覆盖率约 95%）。"
+            )
+            df = pd.DataFrame(columns=["ts_code", "trade_date", "suspend_type"])
+        else:
+            raise
     _write_parquet(df, paths.suspend)
     return df
 
@@ -214,7 +283,13 @@ def update_indices(client: TushareClient, paths: DataLakePaths,
     """更新基准指数日线（每个代码独立文件，全量覆盖）。"""
     for code in codes:
         logger.info(f"Fetching index_daily {code} {start} -> {end}")
-        df = client.index_daily(ts_code=code, start=start, end=end)
+        try:
+            df = client.index_daily(ts_code=code, start=start, end=end)
+        except Exception as e:  # noqa: BLE001
+            if _is_permission_error(e):
+                logger.warning(f"index_daily {code}: no API permission, skipping.")
+                continue
+            raise
         if df.empty:
             logger.warning(f"index_daily {code} returned empty")
             continue

@@ -124,6 +124,14 @@ def data_update(start: str, end: str | None, root: str | None, indices: str) -> 
     for k, v in summary.items():
         table.add_row(k, str(v))
     console.print(table)
+
+    # 提示哪些 panel 因权限被跳过
+    skipped = [k for k, v in summary.items() if v == 0]
+    if skipped:
+        console.print(
+            f"[yellow]NOTE:[/] panels skipped (likely permission): {skipped}. "
+            f"参见 docs/data_layer.md 或检查 https://tushare.pro/document/2"
+        )
     console.print(f"[green]Done.[/] data_lake at {root}")
 
 

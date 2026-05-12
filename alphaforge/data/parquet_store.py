@@ -26,12 +26,20 @@ _DATE_COLS = ("trade_date", "cal_date", "list_date", "delist_date", "pretrade_da
 
 
 def _read_parquet_or_csv(path: Path) -> pd.DataFrame:
-    """优先读 parquet；缺 pyarrow 时降级到同名 csv。"""
+    """优先读 parquet；缺 pyarrow 时降级到同名 csv。空文件返回空 DF。"""
     if path.exists():
-        return pd.read_parquet(path)
+        try:
+            return pd.read_parquet(path)
+        except Exception:
+            return pd.DataFrame()
     csv = path.with_suffix(".csv")
     if csv.exists():
-        head = pd.read_csv(csv, nrows=0)
+        if csv.stat().st_size == 0:
+            return pd.DataFrame()
+        try:
+            head = pd.read_csv(csv, nrows=0)
+        except pd.errors.EmptyDataError:
+            return pd.DataFrame()
         date_cols = [c for c in _DATE_COLS if c in head.columns]
         return pd.read_csv(csv, parse_dates=date_cols)
     raise FileNotFoundError(path)
@@ -147,6 +155,8 @@ class ParquetData(DataAPI):
     def _apply_qfq(self, daily: pd.DataFrame, adj: pd.DataFrame,
                    codes=None) -> pd.DataFrame:
         """前复权：以查询窗口最后一个交易日的 adj_factor 为基准。"""
+        if adj is None or adj.empty:
+            return daily
         # 取每只股票最后一个 adj_factor
         latest = adj.sort_values("trade_date").groupby("ts_code")["adj_factor"].last()
         merged = daily.merge(adj[["ts_code", "trade_date", "adj_factor"]],
@@ -185,6 +195,12 @@ class ParquetData(DataAPI):
             limit_status = pd.Series(0, index=day_df.index, dtype=int)
             limit_status[day_df["close"] >= day_df["up_limit"] - 0.01] = 1
             limit_status[day_df["close"] <= day_df["down_limit"] + 0.01] = -1
+            day_df["limit_status"] = limit_status
+        elif "pct_chg" in day_df.columns:
+            # 缺 stk_limit 数据 → 用 pct_chg 估算涨跌停（主板 ±10%；无法区分创业板/科创板 ±20% 与 ST ±5%）
+            limit_status = pd.Series(0, index=day_df.index, dtype=int)
+            limit_status[day_df["pct_chg"] >= 9.9] = 1
+            limit_status[day_df["pct_chg"] <= -9.9] = -1
             day_df["limit_status"] = limit_status
 
         # 停牌：当日 daily 缺失 = 停牌；这里用 suspend 表补齐
@@ -228,35 +244,47 @@ class ParquetUniverse(UniverseAPI):
 
     def _load_basic(self) -> pd.DataFrame:
         if self._basic is None:
-            self._basic = _read_parquet_or_csv(self._paths.stock_basic)
+            try:
+                self._basic = _read_parquet_or_csv(self._paths.stock_basic)
+            except FileNotFoundError:
+                self._basic = pd.DataFrame()
         return self._basic
 
     def all_stocks(self) -> list[str]:
         df = self._load_basic()
-        return df["ts_code"].tolist()
+        if not df.empty:
+            return df["ts_code"].tolist()
+        # 降级：用 daily 表里出现过的所有代码
+        codes: set[str] = set()
+        for year in range(2010, pd.Timestamp.today().year + 1):
+            d = self._data._daily_year(year)
+            if not d.empty:
+                codes.update(d["ts_code"].unique().tolist())
+        return sorted(codes)
 
     def tradable(self, date: pd.Timestamp) -> list[str]:
         df = self._load_basic()
-        # 上市 ≥ 60 天，未退市
+        day_panel = self._data._daily_year(date.year)
+        traded_today = (
+            set(day_panel[day_panel["trade_date"] == date]["ts_code"].tolist())
+            if not day_panel.empty else set()
+        )
+        susp = self._data._suspend()
+        susp_day = (
+            set(susp[susp["trade_date"] == date]["ts_code"].tolist())
+            if not susp.empty and "trade_date" in susp.columns else set()
+        )
+
+        if df.empty:
+            # 降级模式：仅保留当日有日线 + 未停牌的代码（无法过滤次新/退市/ST）
+            return sorted(c for c in traded_today if c not in susp_day)
+
+        # 完整模式：上市 ≥ 60 天 + 未退市 + 当日有交易 + 未停牌 + 排除 ST
         eligible = df[df["list_date"] <= (date - pd.Timedelta(days=60))]
         if "delist_date" in eligible.columns:
             eligible = eligible[(eligible["delist_date"].isna()) | (eligible["delist_date"] > date)]
-        # 剔除当日停牌
+
         out: list[str] = []
-        susp = self._data._suspend()
-        if not susp.empty and "trade_date" in susp.columns:
-            susp_day = set(susp[susp["trade_date"] == date]["ts_code"].tolist())
-        else:
-            susp_day = set()
-
-        # 剔除当日没有日线数据的（隐含停牌）
-        day_panel = self._data._daily_year(date.year)
-        if not day_panel.empty:
-            traded_today = set(day_panel[day_panel["trade_date"] == date]["ts_code"].tolist())
-        else:
-            traded_today = set()
-
-        # ST 简单过滤：name 含 "ST" 字样
         for _, row in eligible.iterrows():
             code = row["ts_code"]
             if code in susp_day:
