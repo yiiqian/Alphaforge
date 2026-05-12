@@ -26,10 +26,11 @@ uv run alphaforge backtest run --strategy demo_momentum --config configs/run/dem
 ## 当前进度
 
 - [x] M0 项目骨架
-- [ ] M1 数据层（Tushare 最小集，待你的 token 后启用）
+- [x] M1 数据层（Tushare → parquet 数据湖；含权限分级降级）
 - [x] M3a 策略框架（BaseStrategy / Registry / Context）
 - [x] M3b 回测引擎（自研轻量，含 T+1 / 涨跌停 / 停牌 / 成本）
 - [x] M3c Demo 策略 + CLI
+- [x] M4 Paper trading（信号生成器 + APScheduler 守护进程，详见 [docs/paper_trading.md](docs/paper_trading.md)）
 
 ## 写一个策略
 

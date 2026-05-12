@@ -20,6 +20,7 @@ dependencies = [
     "rich>=13.7",             # 终端表格
     "python-dateutil>=2.9",
     "tqdm>=4.66",
+    "apscheduler>=3.10",      # paper-trading 守护进程
 ]
 
 [project.optional-dependencies]

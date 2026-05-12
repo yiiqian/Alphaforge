@@ -1,0 +1,25 @@
+# Demo: 12 个月动量 Top 10，paper-trading 配置
+# 用法：alphaforge paper run --account my_acct --config configs/run/demo_momentum.paper.yaml
+strategy: demo_momentum
+account: demo_momentum
+
+init_cash: 1_000_000
+benchmark: "000300.SH"
+
+# 数据源：只支持 tushare（synthetic 在 paper-trading 没意义）
+data_source: tushare
+
+costs:
+  commission: 0.00025
+  min_commission: 5.0
+  stamp_tax: 0.001
+  slippage: 0.001
+
+params:
+  top_n: 10
+  lookback: 120
+
+# scheduler 配置（paper schedule 子命令读取）
+schedule:
+  cron: "30 15 * * 1-5"          # 工作日 15:30
+  backfill: true                 # 启动时补跑当天（如果还没跑过）

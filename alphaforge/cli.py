@@ -284,5 +284,156 @@ def backtest_run(strategy_name: str, config_path: str, data_source: str, out_dir
     console.print(json.dumps(metrics, indent=2, ensure_ascii=False, default=str))
 
 
+# ---------------- paper trading ----------------
+
+@main.group()
+def paper() -> None:
+    """纸面交易（信号生成器）：每日 15:30 跑策略，输出调仓清单 + 持仓 + 净值。"""
+
+
+def _build_paper_runner(config_path: str, account_name: str | None):
+    """共享：从配置 + account 名加载 PaperRunner。"""
+    import os
+    from alphaforge.data.tushare_bundle import load_tushare_bundle
+    from alphaforge.runtime.paper import PaperRunner
+    from alphaforge.runtime.paper_state import PaperState
+
+    cfg_dict = load_yaml(config_path)
+    strategy_name = cfg_dict["strategy"]
+    account_name = account_name or cfg_dict.get("account") or "default"
+
+    StrategyRegistry.discover(project_root() / "strategies")
+    try:
+        strategy_cls = StrategyRegistry.get(strategy_name)
+    except StrategyNotFound as e:
+        console.print(f"[red]{e}[/]")
+        raise SystemExit(1)
+    strategy = strategy_cls()
+    strategy.params = dict(cfg_dict.get("params") or {})
+
+    # 数据源：paper 只支持 tushare
+    data_source = cfg_dict.get("data_source", "tushare")
+    if data_source != "tushare":
+        console.print(
+            f"[red]paper trading 只支持 data_source=tushare，配置里是 {data_source}[/]"
+        )
+        raise SystemExit(1)
+    if not os.environ.get("TUSHARE_TOKEN"):
+        console.print(
+            "[red]TUSHARE_TOKEN not set.[/] "
+            "Put it in .env (TUSHARE_TOKEN=xxx) or `export TUSHARE_TOKEN=...`"
+        )
+        raise SystemExit(1)
+
+    today = pd.Timestamp.today().normalize()
+    # paper 不需要严格 start/end，bundle 仅用 lookback 范围
+    lookback_days = int(cfg_dict.get("params", {}).get("lookback", 250)) + 30
+    start = today - pd.Timedelta(days=lookback_days * 2)
+    data, universe, calendar = load_tushare_bundle(start=start, end=today)
+
+    # 状态库 & cost
+    db_dir = project_root() / "paper_accounts"
+    db_dir.mkdir(exist_ok=True)
+    state = PaperState(db_dir / f"{account_name}.sqlite")
+    if not state.is_initialized():
+        init_cash = float(cfg_dict.get("init_cash", 1_000_000))
+        state.init_account(
+            init_cash=init_cash,
+            strategy=strategy_name,
+            account=account_name,
+            benchmark=cfg_dict.get("benchmark") or strategy.benchmark,
+        )
+        console.print(f"[green]Initialized paper account[/] '{account_name}' with cash {init_cash:,.0f}")
+
+    cost = CostModel(**(cfg_dict.get("costs") or {}))
+    runner = PaperRunner(
+        strategy=strategy, data=data, universe=universe, calendar=calendar,
+        state=state, cost=cost,
+    )
+    return runner, state, cfg_dict, account_name
+
+
+@paper.command("run")
+@click.option("--config", "config_path", required=True, type=click.Path(exists=True),
+              help="paper 配置 YAML（见 configs/run/demo_momentum.paper.yaml）")
+@click.option("--account", "account_name", default=None,
+              help="账户名（默认读 config.account）")
+@click.option("--date", "as_of", default=None,
+              help="指定日期（YYYY-MM-DD，默认今天）；用于人工补跑历史。")
+def paper_run(config_path: str, account_name: str | None, as_of: str | None) -> None:
+    """跑一次：撮合昨日信号 + 生成今日调仓信号 + 记录 NAV。"""
+    from alphaforge.runtime.paper import format_run_result
+
+    runner, state, _cfg, account_name = _build_paper_runner(config_path, account_name)
+
+    today = pd.Timestamp(as_of) if as_of else pd.Timestamp.today().normalize()
+    try:
+        res = runner.run(today)
+    except RuntimeError as e:
+        console.print(f"[red]Paper run aborted:[/] {e}")
+        raise SystemExit(2)
+
+    console.print(format_run_result(res, account_name=account_name))
+    console.print(f"\n[dim]state at:[/] {state.db_path}")
+
+
+@paper.command("status")
+@click.option("--config", "config_path", required=True, type=click.Path(exists=True),
+              help="paper 配置 YAML")
+@click.option("--account", "account_name", default=None)
+def paper_status(config_path: str, account_name: str | None) -> None:
+    """查看账户当前持仓 + 最近 5 天 NAV + 最近 10 条信号。"""
+    runner, state, _cfg, account_name = _build_paper_runner(config_path, account_name)
+
+    console.print(f"[cyan]account:[/] {account_name}  [dim]({state.db_path})[/]")
+    meta = state.meta()
+    if meta:
+        for k, v in meta.items():
+            console.print(f"  {k}: {v}")
+
+    pos_df = state.positions()
+    if not pos_df.empty:
+        t = Table(title="Current positions")
+        for c in pos_df.columns:
+            t.add_column(c)
+        for _, r in pos_df.iterrows():
+            t.add_row(*[str(r[c]) for c in pos_df.columns])
+        console.print(t)
+    else:
+        console.print("[dim]No positions.[/]")
+
+    nav_df = state.nav_curve()
+    if not nav_df.empty:
+        t = Table(title="NAV (last 5)")
+        for c in nav_df.columns:
+            t.add_column(c)
+        for _, r in nav_df.tail(5).iterrows():
+            t.add_row(*[
+                str(r[c]) if not isinstance(r[c], float) else f"{r[c]:.4f}"
+                for c in nav_df.columns
+            ])
+        console.print(t)
+    else:
+        console.print("[dim]No NAV history.[/]")
+
+
+@paper.command("schedule")
+@click.option("--config", "config_path", required=True, type=click.Path(exists=True))
+@click.option("--account", "account_name", default=None)
+def paper_schedule(config_path: str, account_name: str | None) -> None:
+    """启动守护进程：交易日 15:30 自动跑 paper run。Ctrl-C 退出。"""
+    from alphaforge.runtime.paper_scheduler import run_daemon
+
+    runner, _state, cfg_dict, account_name = _build_paper_runner(config_path, account_name)
+    sched = cfg_dict.get("schedule") or {}
+    cron = sched.get("cron", "30 15 * * 1-5")
+    backfill = bool(sched.get("backfill", True))
+
+    console.print(
+        f"[green]Starting paper scheduler[/] account={account_name} cron='{cron}' backfill={backfill}"
+    )
+    run_daemon(runner, account_name=account_name, cron=cron, backfill=backfill)
+
+
 if __name__ == "__main__":
     main()
