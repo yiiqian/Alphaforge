@@ -43,10 +43,17 @@ from alphaforge.infra.logger import logger
 DEFAULT_INDICES = ["000300.SH", "000905.SH", "000852.SH", "000001.SH"]
 
 
-def _is_permission_error(exc: Exception) -> bool:
-    """识别 Tushare 权限不足错误。"""
-    msg = str(exc).lower()
-    return any(k in msg for k in ("没有接口", "权限", "积分", "permission", "权限不足"))
+def _is_permission_error(exc: BaseException | None) -> bool:
+    """识别 Tushare 权限不足错误。沿 __cause__ / __context__ 链穿透。"""
+    seen: set[int] = set()
+    cur: BaseException | None = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        msg = str(cur).lower()
+        if any(k in msg for k in ("没有接口", "权限", "积分", "permission", "权限不足")):
+            return True
+        cur = cur.__cause__ or cur.__context__
+    return False
 
 
 @dataclass

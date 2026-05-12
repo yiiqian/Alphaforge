@@ -91,6 +91,10 @@ class TushareClient:
                 return df
             except Exception as e:  # noqa: BLE001
                 last_exc = e
+                msg = str(e)
+                # 权限错误不可恢复，立刻抛出（让上层走优雅降级路径）
+                if any(k in msg for k in ("没有接口", "权限", "积分", "permission")):
+                    raise
                 wait = self.cfg.retry_backoff ** attempt
                 logger.warning(
                     f"Tushare {api_name} failed (attempt {attempt + 1}/"
