@@ -23,3 +23,54 @@ params:
 schedule:
   cron: "30 15 * * 1-5"          # 工作日 15:30
   backfill: true                 # 启动时补跑当天（如果还没跑过）
+
+# ============================================================
+# M5: 通知通道（飞书 / 企微 / QQ 三选一，或都填走 multi）
+# ------------------------------------------------------------
+# 推荐：飞书自定义机器人。在群里 → 设置 → 群机器人 → 添加自定义机器人，
+# 拿到 webhook 后塞到环境变量 FEISHU_WEBHOOK（或直接写 url，但不建议）。
+# 如果机器人开了"签名校验"，再把 secret 配上。
+# ============================================================
+notify:
+  type: feishu
+  webhook: "${FEISHU_WEBHOOK}"
+  # secret: "${FEISHU_SIGN_SECRET}"   # 仅当机器人开了"签名校验"时填
+
+  # ------ 备选：企业微信群机器人 ------
+  # type: wecom
+  # webhook: "${WECOM_WEBHOOK}"
+
+  # ------ 备选：QQ（需自建 OneBot v11，如 NapCat / Lagrange / go-cqhttp）------
+  # type: qq
+  # base_url: "http://127.0.0.1:5700"
+  # token: "${QQ_ACCESS_TOKEN}"           # OneBot 服务的 access_token，可空
+  # target: 123456789                     # group_id 或 user_id
+  # target_kind: group                    # group / private
+
+  # ------ 同时推多个：------
+  # type: multi
+  # channels:
+  #   - { type: feishu, webhook: "${FEISHU_WEBHOOK}" }
+  #   - { type: wecom,  webhook: "${WECOM_WEBHOOK}" }
+
+# ============================================================
+# M5: LLM 策略解释（DeepSeek 默认；不配置就走 fallback 模板，不影响主流程）
+# 充值 1 块钱 DeepSeek 够跑几百次。
+# ============================================================
+llm:
+  provider: deepseek
+  model: deepseek-chat
+  api_key: "${DEEPSEEK_API_KEY}"
+  max_tokens: 700
+  temperature: 0.3
+
+  # ------ 备选：Claude（Anthropic API）------
+  # provider: claude
+  # model: claude-sonnet-4-5
+  # api_key: "${ANTHROPIC_API_KEY}"
+
+  # ------ 备选：OpenAI 兼容（通义千问 / Kimi / 智谱 / 本地 Ollama）------
+  # provider: openai
+  # model: qwen-plus
+  # base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1"
+  # api_key: "${DASHSCOPE_API_KEY}"

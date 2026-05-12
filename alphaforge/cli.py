@@ -346,9 +346,14 @@ def _build_paper_runner(config_path: str, account_name: str | None):
         console.print(f"[green]Initialized paper account[/] '{account_name}' with cash {init_cash:,.0f}")
 
     cost = CostModel(**(cfg_dict.get("costs") or {}))
+
+    # M5：可选的 LLM 解释
+    from alphaforge.explain.base import build_explainer
+    explainer = build_explainer(cfg_dict.get("llm"))
+
     runner = PaperRunner(
         strategy=strategy, data=data, universe=universe, calendar=calendar,
-        state=state, cost=cost,
+        state=state, cost=cost, explainer=explainer,
     )
     return runner, state, cfg_dict, account_name
 
@@ -360,11 +365,14 @@ def _build_paper_runner(config_path: str, account_name: str | None):
               help="账户名（默认读 config.account）")
 @click.option("--date", "as_of", default=None,
               help="指定日期（YYYY-MM-DD，默认今天）；用于人工补跑历史。")
-def paper_run(config_path: str, account_name: str | None, as_of: str | None) -> None:
+@click.option("--notify/--no-notify", default=False,
+              help="是否同时按配置发送通知（飞书/企微/QQ）。默认不发，仅打印到终端。")
+def paper_run(config_path: str, account_name: str | None, as_of: str | None, notify: bool) -> None:
     """跑一次：撮合昨日信号 + 生成今日调仓信号 + 记录 NAV。"""
-    from alphaforge.runtime.paper import format_run_result
+    from alphaforge.notify.base import build_notifier
+    from alphaforge.runtime.paper import format_for_notification, format_run_result
 
-    runner, state, _cfg, account_name = _build_paper_runner(config_path, account_name)
+    runner, state, cfg_dict, account_name = _build_paper_runner(config_path, account_name)
 
     today = pd.Timestamp(as_of) if as_of else pd.Timestamp.today().normalize()
     try:
@@ -375,6 +383,12 @@ def paper_run(config_path: str, account_name: str | None, as_of: str | None) -> 
 
     console.print(format_run_result(res, account_name=account_name))
     console.print(f"\n[dim]state at:[/] {state.db_path}")
+
+    if notify:
+        notifier = build_notifier(cfg_dict.get("notify"))
+        title, body, level = format_for_notification(res, account_name=account_name)
+        ok = notifier.send(title, body, level=level)
+        console.print(f"[{'green' if ok else 'red'}]notify:[/] {notifier.name} → {'ok' if ok else 'failed'}")
 
 
 @paper.command("status")
@@ -422,6 +436,7 @@ def paper_status(config_path: str, account_name: str | None) -> None:
 @click.option("--account", "account_name", default=None)
 def paper_schedule(config_path: str, account_name: str | None) -> None:
     """启动守护进程：交易日 15:30 自动跑 paper run。Ctrl-C 退出。"""
+    from alphaforge.notify.base import build_notifier
     from alphaforge.runtime.paper_scheduler import run_daemon
 
     runner, _state, cfg_dict, account_name = _build_paper_runner(config_path, account_name)
@@ -429,10 +444,93 @@ def paper_schedule(config_path: str, account_name: str | None) -> None:
     cron = sched.get("cron", "30 15 * * 1-5")
     backfill = bool(sched.get("backfill", True))
 
+    notifier = build_notifier(cfg_dict.get("notify"))
+
     console.print(
-        f"[green]Starting paper scheduler[/] account={account_name} cron='{cron}' backfill={backfill}"
+        f"[green]Starting paper scheduler[/] account={account_name} cron='{cron}' "
+        f"backfill={backfill} notify={notifier.name}"
     )
-    run_daemon(runner, account_name=account_name, cron=cron, backfill=backfill)
+    run_daemon(
+        runner, account_name=account_name, cron=cron, backfill=backfill,
+        notifier=notifier,
+    )
+
+
+@paper.command("explain")
+@click.option("--config", "config_path", required=True, type=click.Path(exists=True))
+@click.option("--account", "account_name", default=None)
+@click.option("--date", "as_of", default=None,
+              help="解释哪一天的最近一次跑（默认今天）；只读，不重新跑策略。")
+def paper_explain(config_path: str, account_name: str | None, as_of: str | None) -> None:
+    """重新生成最近一次 paper run 的 LLM 解释（不重新跑策略）。便于调试 prompt。"""
+    from alphaforge.explain.base import build_explainer
+    from alphaforge.explain.prompt import build_payload, fallback_text
+    from alphaforge.runtime.paper import PaperRunResult
+
+    runner, state, cfg_dict, account_name = _build_paper_runner(config_path, account_name)
+    today = pd.Timestamp(as_of) if as_of else pd.Timestamp.today().normalize()
+
+    sigs = state.signals_on(today)
+    pos_df = state.positions()
+    nav_df = state.nav_curve()
+    nav_row = nav_df[nav_df["date"] == today].tail(1) if not nav_df.empty else nav_df
+
+    res = PaperRunResult(date=today)
+    res.rebalance = not sigs.empty
+    if not sigs.empty:
+        for _, r in sigs.iterrows():
+            row = {"ts_code": r["ts_code"], "qty": int(r["qty"]),
+                   "ref_price": float(r["ref_price"]), "fees": float(r["fees"]),
+                   "reason": r.get("reason", "")}
+            (res.buys if r["side"] == "buy" else res.sells).append(row)
+    if not nav_row.empty:
+        n = nav_row.iloc[0]
+        res.nav = {
+            "cash": float(n["cash"]), "market_value": float(n["market_value"]),
+            "equity": float(n["equity"]), "n_positions": int(n["n_positions"]),
+        }
+
+    positions_snapshot = (
+        [{"ts_code": r["ts_code"], "qty": int(r["qty"])} for _, r in pos_df.iterrows()]
+        if not pos_df.empty else []
+    )
+    payload = build_payload(
+        res,
+        strategy_name=runner.strategy.name,
+        strategy_desc=runner.strategy.description,
+        rebalance_freq=runner.strategy.rebalance,
+        positions_snapshot=positions_snapshot,
+        benchmark=runner.strategy.benchmark,
+    )
+    explainer = build_explainer(cfg_dict.get("llm"))
+    text = explainer.explain(payload, fallback=fallback_text(payload))
+    console.print(f"[cyan]explainer:[/] {explainer.name}")
+    console.print(text)
+
+
+# ---------------- notify ----------------
+
+@main.group()
+def notify() -> None:
+    """通知通道管理（飞书 / 企微 / QQ）。"""
+
+
+@notify.command("test")
+@click.option("--config", "config_path", required=True, type=click.Path(exists=True),
+              help="任意带 notify 段的 yaml（paper config 也可以复用）")
+def notify_test(config_path: str) -> None:
+    """发一条 'hello from alphaforge' 测试通知通道是否配通。"""
+    from alphaforge.notify.base import build_notifier
+
+    cfg = load_yaml(config_path)
+    notifier = build_notifier(cfg.get("notify"))
+    console.print(f"[cyan]notifier:[/] {notifier.name}")
+    ok = notifier.test()
+    if ok:
+        console.print("[green]✅ 已发送，去群里检查是否收到。[/]")
+    else:
+        console.print("[red]❌ 发送失败，看日志排查（webhook 是否对、是否被签名校验拦下、是否被频控）。[/]")
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

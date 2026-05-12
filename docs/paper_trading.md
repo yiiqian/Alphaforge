@@ -5,7 +5,7 @@
 ## 设计目标
 
 1. **可重复**：每天能在固定时间自动产出当日调仓清单 + 持仓快照 + 净值；
-2. **可解释**：每条信号都带 `reason`，未来 M5 接 LLM 后会自动生成"为什么买/卖"的中文解释；
+2. **可解释**：每条信号都带 `reason`，M5 已接 LLM（DeepSeek / Claude / OpenAI 兼容）自动生成"为什么买/卖"的中文解释，详见 [docs/notifications.md](notifications.md)；
 3. **强一致**：状态全部落在 SQLite（每个账户一个 `.sqlite` 文件），同一天重跑幂等；
 4. **共用约束**：T+1 / 涨跌停 / 停牌过滤、滑点、佣金印花税 100% 复用回测引擎的代码（`runtime/constraints.py`、`runtime/costs.py`）。
 
@@ -89,7 +89,9 @@ uv run alphaforge paper run --config <path> --date 2026-05-12
     000333.SZ  qty=  500  ref= 75.300  fees= 9.41
     ...
 [nav] cash=234,567.89  mv=812,345.67  equity=1,046,913.56  positions=10
-[explain] (auto-explanation slot — wired up in M5)
+[explain]
+  今日为月度调仓日，根据 12 月动量截面排序新增买入 3 只、卖出 2 只...
+  （配置 LLM 后由 DeepSeek / Claude 自动生成，详见 docs/notifications.md）
 ```
 
 ### 3) 查看账户状态
@@ -134,8 +136,8 @@ nohup uv run alphaforge paper schedule --config <path> >> paper.log 2>&1 &
 - **同一天重跑幂等**：`signals` 用 `(date, ts_code, side)` 主键 + `INSERT OR REPLACE`，重复跑不会双倍下单。
 - **崩溃恢复**：所有写在事务里，崩溃后下次 run 会从最近的一致状态续跑。
 
-## 后续扩展（M5+）
+## 后续扩展
 
-- `[explain]` 占位接入 LLM，每日生成中文解释推送到飞书 / 微信；
-- 多账户并存（已支持 — 不同 `--account` 即不同 sqlite 文件），方便对比策略；
-- Telegram / 飞书 Bot 推送（在 `paper_scheduler.run_daemon` 的 `on_finish` 钩子里加即可）。
+- ✅ M5 通知 + LLM 解释 — 已交付，见 [docs/notifications.md](notifications.md)。
+- M6 券商对接（实盘下单）— 待规划，预计接 QMT / EasyTrader / 模拟盘。
+- 多账户并存（已支持 — 不同 `--account` 即不同 sqlite 文件），方便对比策略。

@@ -17,7 +17,12 @@ from typing import Callable
 import pandas as pd
 
 from alphaforge.infra.logger import logger
-from alphaforge.runtime.paper import PaperRunner, format_run_result
+from alphaforge.notify.base import Notifier
+from alphaforge.runtime.paper import (
+    PaperRunner,
+    format_for_notification,
+    format_run_result,
+)
 
 
 def _today_local() -> pd.Timestamp:
@@ -26,8 +31,13 @@ def _today_local() -> pd.Timestamp:
 
 def make_job(runner: PaperRunner, *,
              account_name: str = "default",
+             notifier: Notifier | None = None,
              on_finish: Callable[[str], None] | None = None) -> Callable[[], None]:
-    """生成一个 0-arg job，APScheduler 直接 schedule 这个回调。"""
+    """生成一个 0-arg job，APScheduler 直接 schedule 这个回调。
+
+    notifier: 不为 None 时，每次跑完用 notifier.send(...) 推送一条精简卡片。
+    on_finish: 兼容旧用法 — 仅接收 plain-text run 报告。
+    """
 
     def _job() -> None:
         today = _today_local()
@@ -38,13 +48,32 @@ def make_job(runner: PaperRunner, *,
             res = runner.run(today)
             text = format_run_result(res, account_name=account_name)
             logger.info("\n" + text)
+
+            if notifier is not None:
+                title, body, level = format_for_notification(res, account_name=account_name)
+                try:
+                    ok = notifier.send(title=title, text=body, level=level)
+                    if not ok:
+                        logger.warning("[paper-scheduler] notifier.send returned False")
+                except Exception:
+                    logger.exception("[paper-scheduler] notifier.send raised; ignored.")
+
             if on_finish is not None:
                 try:
                     on_finish(text)
                 except Exception:
                     logger.exception("on_finish callback raised; ignored.")
-        except Exception:
+        except Exception as e:
             logger.exception(f"[paper-scheduler] run failed for {today.date()}")
+            if notifier is not None:
+                try:
+                    notifier.send(
+                        title=f"❌ Paper run failed @ {today.date()}",
+                        text=f"`{type(e).__name__}: {e}`\n\n请到日志文件查看完整堆栈。",
+                        level="error",
+                    )
+                except Exception:
+                    logger.exception("notifier.send (error path) raised; ignored.")
 
     return _job
 
@@ -55,6 +84,7 @@ def run_daemon(
     account_name: str = "default",
     cron: str = "30 15 * * 1-5",     # 15:30, Mon-Fri
     backfill: bool = True,
+    notifier: Notifier | None = None,
     on_finish: Callable[[str], None] | None = None,
 ) -> None:
     """启动调度器并阻塞。Ctrl-C 优雅退出。"""
@@ -67,7 +97,7 @@ def run_daemon(
             "apscheduler not installed. `uv add apscheduler` or `pip install apscheduler`."
         ) from e
 
-    job = make_job(runner, account_name=account_name, on_finish=on_finish)
+    job = make_job(runner, account_name=account_name, notifier=notifier, on_finish=on_finish)
 
     scheduler = BlockingScheduler(timezone="Asia/Shanghai")
     scheduler.add_job(

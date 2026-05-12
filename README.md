@@ -31,6 +31,7 @@ uv run alphaforge backtest run --strategy demo_momentum --config configs/run/dem
 - [x] M3b 回测引擎（自研轻量，含 T+1 / 涨跌停 / 停牌 / 成本）
 - [x] M3c Demo 策略 + CLI
 - [x] M4 Paper trading（信号生成器 + APScheduler 守护进程，详见 [docs/paper_trading.md](docs/paper_trading.md)）
+- [x] M5 通知 + LLM 策略解释（飞书 / 企微 / QQ + DeepSeek / Claude / OpenAI 兼容，详见 [docs/notifications.md](docs/notifications.md)）
 
 ## 写一个策略
 

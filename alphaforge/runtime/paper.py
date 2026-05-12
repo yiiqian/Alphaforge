@@ -22,6 +22,7 @@ from typing import Any
 import pandas as pd
 
 from alphaforge.data.api import CalendarAPI, DataAPI, UniverseAPI
+from alphaforge.explain.base import Explainer
 from alphaforge.infra.logger import logger
 from alphaforge.runtime.backtest import _is_rebalance_day, _round_lot
 from alphaforge.runtime.constraints import can_buy, can_sell
@@ -43,6 +44,7 @@ class PaperRunResult:
     nav: dict = field(default_factory=dict)                  # {cash, market_value, equity, n_positions}
     skipped: list[dict] = field(default_factory=list)        # 因约束被跳过的目标 [{ts_code, reason}]
     next_trade_day: pd.Timestamp | None = None
+    explanation: str = ""                                    # LLM 生成的中文解释（可空）
 
     def to_dict(self) -> dict[str, Any]:
         out = {
@@ -54,6 +56,7 @@ class PaperRunResult:
             "nav": self.nav,
             "skipped": self.skipped,
             "next_trade_day": str(self.next_trade_day.date()) if self.next_trade_day else None,
+            "explanation": self.explanation,
         }
         return out
 
@@ -70,6 +73,7 @@ class PaperRunner:
         state: PaperState,
         *,
         cost: CostModel | None = None,
+        explainer: Explainer | None = None,
     ) -> None:
         self.strategy = strategy
         self.data = data
@@ -77,6 +81,7 @@ class PaperRunner:
         self.calendar = calendar
         self.state = state
         self.cost = cost or CostModel()
+        self.explainer = explainer
 
     # ---------- 校验 ----------
 
@@ -317,6 +322,28 @@ class PaperRunner:
         except Exception:
             logger.exception("strategy.teardown failed (ignored)")
 
+        # 5) LLM 解释（最后一步，失败不影响主结果）
+        if self.explainer is not None:
+            try:
+                from alphaforge.explain.prompt import build_payload, fallback_text
+                positions_snapshot = [
+                    {"ts_code": code, "qty": pos.qty}
+                    for code, pos in account.positions.items() if pos.qty > 0
+                ]
+                payload = build_payload(
+                    result,
+                    strategy_name=getattr(self.strategy, "name", "unknown"),
+                    strategy_desc=getattr(self.strategy, "description", ""),
+                    rebalance_freq=getattr(self.strategy, "rebalance", ""),
+                    positions_snapshot=positions_snapshot,
+                    benchmark=getattr(self.strategy, "benchmark", None),
+                )
+                result.explanation = self.explainer.explain(
+                    payload, fallback=fallback_text(payload)
+                )
+            except Exception:
+                logger.exception("explainer.explain failed (ignored)")
+
         return result
 
 
@@ -373,6 +400,72 @@ def format_run_result(res: PaperRunResult, account_name: str = "default") -> str
         f"equity={n.get('equity', 0):,.2f}  positions={n.get('n_positions', 0)}"
     )
 
-    # 占位：策略解释 — M5 才接 LLM；目前留空白行让 paper bot 渲染
-    lines.append("[explain] (auto-explanation slot — wired up in M5)")
+    # 策略解释（M5：LLM 自动生成）
+    if res.explanation:
+        lines.append("[explain]")
+        for ln in res.explanation.splitlines():
+            lines.append(f"  {ln}")
     return "\n".join(lines)
+
+
+def format_for_notification(res: PaperRunResult, account_name: str = "default") -> tuple[str, str, str]:
+    """专门给 Notifier 用的精简渲染 → (title, markdown_body, level)。
+
+    比 format_run_result 更紧凑，专给手机推送看：
+      - 标题：日期 + 账户 + 一句话状态
+      - body：用 markdown 表格列出 buy / sell / nav，附 LLM 解释
+      - level：根据当日表现轻量推断（默认 info）
+    """
+    date = res.date.date()
+    title = f"📈 {date}  {account_name}"
+    if res.rebalance:
+        title += f"  · 调仓 {len(res.buys)}买/{len(res.sells)}卖"
+    else:
+        title += "  · 未调仓"
+
+    n = res.nav or {}
+    s = res.settled or {}
+
+    md: list[str] = []
+    md.append(f"**净值**：{n.get('equity', 0):,.2f}　**持仓**：{n.get('n_positions', 0)}")
+    md.append(f"**现金**：{n.get('cash', 0):,.2f}　**市值**：{n.get('market_value', 0):,.2f}")
+    md.append("")
+    md.append(
+        f"**今日撮合**：买 {s.get('n_buy', 0)} / 卖 {s.get('n_sell', 0)}　"
+        f"现金净流 {s.get('cash_delta', 0):,.2f}"
+    )
+
+    if res.rebalance and (res.buys or res.sells):
+        next_day_str = res.next_trade_day.date() if res.next_trade_day else "(N/A)"
+        md.append("")
+        md.append(f"**待执行（{next_day_str} open）**")
+        if res.buys:
+            md.append("")
+            md.append("买入：")
+            for b in res.buys[:10]:
+                md.append(f"- `{b['ts_code']}`  {b['qty']} 股  @ {b['ref_price']:.3f}")
+            if len(res.buys) > 10:
+                md.append(f"- ... 另有 {len(res.buys)-10} 只")
+        if res.sells:
+            md.append("")
+            md.append("卖出：")
+            for s_ in res.sells[:10]:
+                md.append(f"- `{s_['ts_code']}`  {s_['qty']} 股  @ {s_['ref_price']:.3f}")
+            if len(res.sells) > 10:
+                md.append(f"- ... 另有 {len(res.sells)-10} 只")
+
+    if res.skipped:
+        md.append("")
+        md.append(
+            "**跳过**："
+            + "、".join(f"{x['ts_code']}({x['reason']})" for x in res.skipped[:6])
+            + (" ..." if len(res.skipped) > 6 else "")
+        )
+
+    if res.explanation:
+        md.append("")
+        md.append("---")
+        md.append("**策略解释**")
+        md.append(res.explanation)
+
+    return title, "\n".join(md), "info"
